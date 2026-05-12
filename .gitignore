@@ -1,0 +1,5 @@
+.idea/
+.env
+__pycache__/
+*.png
+temp_screen.png
