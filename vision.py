@@ -1,3 +1,50 @@
+#Summary on how the vision manager works(also included in the README file):
+# ------------------------------------------------------------------ #
+# VisionManager uses a prompt chaining architecture to locate a target
+# icon on screen. Rather than asking one prompt to do everything, the
+# task is broken into three focused stages where each stage's output
+# feeds into the next, making each step more accurate in isolation.
+#
+# Stage A — Planner:
+#   Takes the full screenshot and asks Gemini to scan all quadrants of
+#   the desktop and return up to 3 ranked candidate areas where the
+#   target icon might be, along with a neighboring icon for context.
+#   Output: a list of candidate bounding boxes with probabilities.
+#
+# Stage B — Grounder:
+#   Takes each candidate crop from the Planner and asks Gemini to
+#   locate the icon precisely within that smaller image. Only works on
+#   a zoomed-in region so it doesn't have to reason about the full
+#   screen. Output: a tight bounding box and confidence score.
+#
+# Stage C — Verifier:
+#   Takes the predicted pixel coordinates from the Grounder, draws a
+#   red circle at that point, and asks Gemini to confirm whether the
+#   circle is centred on the correct icon. If it is off-centre, the
+#   Verifier returns a corrected box. Output: verified or corrected
+#   final coordinates.
+#
+# Fallback chain (in order if any stage fails):
+#   1. Gemini (Planner → Grounder → Verifier) — primary pipeline.
+#      Each individual Gemini API call is retried up to 4 times with
+#      exponential backoff if a transient error occurs (503, 429 etc),
+#      doubling the wait time between each attempt.
+#   2. GPT-4o — single prompt asking OpenAI to locate the icon directly
+#      from the full screenshot, used if Gemini fails entirely.
+#   3. OpenCV template matching — purely local, no AI, matches a saved
+#      icon image against the screenshot using pixel similarity.
+#
+# The full fallback chain is retried up to 3 times before giving up,
+# with a fresh screenshot taken on each retry.
+#
+# Coordinate caching:
+#   Once a target is successfully grounded, its coordinates are cached
+#   by the orchestrator and reused for subsequent posts, skipping the
+#   entire pipeline. If a click using cached coordinates fails to open
+#   the target (validated by WindowManager), the cache is invalidated
+#   and the full pipeline runs again to find the updated position.
+# ------------------------------------------------------------------ #
+
 import os
 import time
 import json
