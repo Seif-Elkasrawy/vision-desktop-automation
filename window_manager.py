@@ -1,5 +1,6 @@
 import time
 import pygetwindow as gw
+from constants import POLL_INTERVAL_S
 
 class WindowManager:
     @staticmethod
@@ -8,5 +9,5 @@ class WindowManager:
         while time.time() - start_time < timeout:
             if [w for w in gw.getAllTitles() if title_keyword in w]:
                 return True
-            time.sleep(0.5)
+            time.sleep(POLL_INTERVAL_S)
         return False
