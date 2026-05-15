@@ -10,9 +10,8 @@ from openai import OpenAI
 from google import genai
 from google.genai import types # Added for JSON mode
 
-# Half-width/height in pixels of the verification window drawn around the
-# grounder's predicted centre.  Large enough to include the icon + label.
-VERIFY_RADIUS = 80
+from prompts import PLANNER, GROUNDER, VERIFIER
+from constants import RETRY_DELAY_S, VERIFY_RADIUS
 
 class VisionManager:
     def __init__(self, config):
@@ -32,78 +31,25 @@ class VisionManager:
         #  * Returns up to 3 ranked candidate areas instead of one
         #  * Neighbor inference: model names adjacent icons to anchor reasoning
         #  * Explicit instruction to look at the image, not guess from priors
-        planner_prompt = f"""
-You are a GUI grounding assistant examining a REAL screenshot of a Windows desktop.
- 
-Target: find the desktop shortcut icon whose label contains "{target}".
- 
-IMPORTANT: Do NOT assume a default position (e.g. bottom-left). You MUST reason
-from what you actually see in the screenshot.
- 
-Step 1 - Orient yourself: identify the Taskbar, the Recycle Bin, and any other
-         visible desktop icons. Note their approximate positions.
-Step 2 - Scan ALL quadrants of the desktop area (above the taskbar) carefully.
-         Describe what icons you see in each quadrant.
-Step 3 - Propose up to 3 candidate areas where "{target}" might be, ranked by
-         probability. For each, name a neighboring icon you can see nearby to
-         confirm the region.
- 
-Return JSON with this EXACT structure:
-{{
-  "reasoning": "<step-by-step description of what you see and where you looked>",
-  "candidates": [
-    {{
-      "area_box": [xmin, ymin, xmax, ymax],
-      "neighbor": "<name of a nearby icon or UI element visible in this area>",
-      "probability": <float 0.0-1.0>
-    }}
-  ]
-}}
- 
-Rules:
-- area_box values are integers 0-1000 (normalised: 0=left/top edge, 1000=right/bottom edge).
-- List candidates in descending probability order.
-- Each box should be roughly 300-600 units wide/tall to give enough context.
-- Return an empty list if you truly cannot locate any plausible area.
-"""
- 
-        planner_schema = {
-            "type": "OBJECT",
-            "properties": {
-                "reasoning": {"type": "STRING"},
-                "candidates": {
-                    "type": "ARRAY",
-                    "items": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "area_box":    {"type": "ARRAY",  "items": {"type": "NUMBER"}},
-                            "neighbor":    {"type": "STRING"},
-                            "probability": {"type": "NUMBER"},
-                        },
-                        "required": ["area_box", "probability"],
-                    },
-                },
-            },
-            "required": ["candidates"],
-        }
- 
         try:
+            # Stage A – Planner
             planner_text = self._gemini_call_with_retry(
-                prompt=planner_prompt, image=screenshot, schema=planner_schema
+                prompt=PLANNER["prompt"].format(target=target),
+                image=screenshot,
+                schema=PLANNER["schema"],
             )
-            plan = json.loads(planner_text)
- 
+            plan       = json.loads(planner_text)
             reasoning  = plan.get("reasoning", "")
             candidates = plan.get("candidates", [])
  
             print(f"[Planner] Reasoning: {reasoning}")
-            print(f"[Planner] {len(candidates)} candidate(s) returned.")
+            print(f"[Planner] {len(candidates)} candidate(s).")
  
             if not candidates:
                 print("[Planner] No candidates returned.")
                 return None
  
-            # ---- Stage B: Grounder on each candidate; keep best result -- #
+            # ---- Stage B: Grounder on each candidate; keep best verified result -- #
             best_coords     = None
             best_confidence = 0.0
  
@@ -141,7 +87,7 @@ Rules:
                 screen_x = left + cx_crop
                 screen_y = top  + cy_crop
  
-                # ---- Stage C: Verification (paper Table 8) ------------- #
+                # ---- Stage C: Verification ------------- #
                 # Crop a small window around the predicted point and ask
                 # Gemini: "is this actually the target icon?"
                 verified, new_x, new_y = self._verify_prediction(
@@ -181,49 +127,16 @@ Rules:
         """
         crop_w, crop_h = crop.size
  
-        grounder_prompt = f"""
-You are a GUI grounding assistant.
- 
-Look carefully at this zoomed-in crop of a Windows desktop and locate the
-"{target}" shortcut icon.
- 
-Step 1 - List every icon label and graphic you can see in this image.
-Step 2 - Identify which one matches "{target}". If none match, set found=false
-         and confidence=0.
-Step 3 - Return the bounding box of the ICON GRAPHIC ONLY (not its text label).
- 
-Return JSON:
-{{
-  "found": true | false,
-  "label_seen": "<exact text label visible under or near the matching icon>",
-  "target_box": [xmin, ymin, xmax, ymax],
-  "confidence": <float 0.0-1.0>
-}}
- 
-Coordinates are integers 0-1000 normalised to the WIDTH and HEIGHT of this crop.
-Set confidence=0 and found=false if "{target}" is not present in this image.
-"""
- 
-        grounder_schema = {
-            "type": "OBJECT",
-            "properties": {
-                "found":      {"type": "BOOLEAN"},
-                "label_seen": {"type": "STRING"},
-                "target_box": {"type": "ARRAY", "items": {"type": "NUMBER"}},
-                "confidence": {"type": "NUMBER"},
-            },
-            "required": ["found", "target_box", "confidence"],
-        }
- 
         try:
-            resp_text = self._gemini_call_with_retry(
-                prompt=grounder_prompt, image=crop, schema=grounder_schema
-            )
-            result = json.loads(resp_text)
+            resp = json.loads(self._gemini_call_with_retry(
+                prompt=GROUNDER["prompt"].format(target=target),
+                image=crop,
+                schema=GROUNDER["schema"],
+            ))
  
-            confidence = float(result.get("confidence", 0.0))
-            found      = result.get("found", False)
-            label_seen = result.get("label_seen", "")
+            confidence = float(resp.get("confidence", 0.0))
+            found      = resp.get("found", False)
+            label_seen = resp.get("label_seen", "")
  
             print(f"[Grounder] Candidate {candidate_idx}: found={found}, "
                   f"label='{label_seen}', confidence={confidence:.2f}")
@@ -231,7 +144,7 @@ Set confidence=0 and found=false if "{target}" is not present in this image.
             if not found or confidence < 0.5:
                 return None, 0.0
  
-            box = result.get("target_box", [])
+            box = resp.get("target_box", [])
             if len(box) != 4:
                 return None, 0.0
  
@@ -254,7 +167,7 @@ Set confidence=0 and found=false if "{target}" is not present in this image.
  
         Returns (verified: bool, refined_x or None, refined_y or None).
         """
-        r = VERIFY_RADIUS
+        r = VERIFY_RADIUS # pixels around the predicted centre to include in the verification crop
         vx1 = max(0,     pred_x - r)
         vy1 = max(0,     pred_y - r)
         vx2 = min(img_w, pred_x + r)
@@ -275,58 +188,25 @@ Set confidence=0 and found=false if "{target}" is not present in this image.
             outline="red", width=3
         )
  
-        verify_prompt = f"""
-You are given a small crop of a Windows desktop.
-A red circle marks the element we believe is the "{target}" icon.
- 
-Please evaluate whether the circled element is correct:
- 
-Step 1 - Describe the visible content: what icons, labels, or UI elements are present?
-Step 2 - Determine which of the following applies to the circled element:
-   - "is_target":       the circled element IS the "{target}" icon
-   - "target_elsewhere": the circled element is NOT "{target}", but "{target}" IS
-                          visible somewhere else in this crop
-   - "target_not_found": "{target}" is not visible anywhere in this crop
- 
-Step 3 - If the result is "target_elsewhere", provide the corrected bounding box.
- 
-Return JSON:
-{{
-  "result": "is_target" | "target_elsewhere" | "target_not_found",
-  "description": "<brief description of what you see>",
-  "corrected_box": [xmin, ymin, xmax, ymax] | null
-}}
- 
-corrected_box is in 0-1000 coordinates normalised to this crop's width and height.
-Only populate it when result is "target_elsewhere".
-"""
- 
-        verify_schema = {
-            "type": "OBJECT",
-            "properties": {
-                "result":        {"type": "STRING"},
-                "description":   {"type": "STRING"},
-                "corrected_box": {"type": "ARRAY", "items": {"type": "NUMBER"}},
-            },
-            "required": ["result"],
-        }
- 
         try:
-            vresp = json.loads(self._gemini_call_with_retry(
-                verify_prompt, annotated, verify_schema
+            resp = json.loads(self._gemini_call_with_retry(
+                prompt=VERIFIER["prompt"].format(target=target),
+                image=annotated,
+                schema=VERIFIER["schema"],
             ))
  
-            result_str  = vresp.get("result", "target_not_found")
-            description = vresp.get("description", "")
+            result_str  = resp.get("result", "target_not_found")
+            description = resp.get("description", "")
             print(f"[Verify] result='{result_str}' | {description}")
  
             if result_str == "is_target":
                 return True, None, None  # prediction is correct as-is
  
             if result_str == "target_elsewhere":
-                cbox = vresp.get("corrected_box")
+                cbox = resp.get("corrected_box")
                 if cbox and len(cbox) == 4:
-                    cx_n, cy_n = (cbox[0] + cbox[2]) / 2, (cbox[1] + cbox[3]) / 2
+                    cx_n = (cbox[0] + cbox[2]) / 2
+                    cy_n = (cbox[1] + cbox[3]) / 2
                     refined_x = vx1 + int(cx_n * vcw / 1000)
                     refined_y = vy1 + int(cy_n * vch / 1000)
                     print(f"[Verify] Corrected to ({refined_x}, {refined_y})")
@@ -457,7 +337,7 @@ Only populate it when result is "target_elsewhere".
             )
             if coords:
                 return coords
-            time.sleep(1)
+            time.sleep(RETRY_DELAY_S)
  
         print(f"[VisionManager] All grounding attempts failed for '{target}'.")
         return None
